@@ -1,0 +1,183 @@
+# Public community build (decision D11, option 2) of the Minecraft x GTA V passthrough example from
+# universal-modder by Rehan and contributors (MIT), at a pinned, reviewed commit.
+# Run it from the Actions tab: "Build and release" -> Run workflow -> tag (e.g. v0.1.0).
+# Release files: the GTA-side zip, the Fabric mod jar, LICENSE, NOTICE and SHA256SUMS.
+# Never included: ScriptHookV.dll, its ASI loader, the ScriptHookV SDK, ReShade or game files.
+name: Build and release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create, e.g. v0.1.0 (empty = test build, files under the run's Artifacts)
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      TAG: ${{ inputs.tag }}
+      EX: examples/minecraft-gta5-passthrough
+      RESHADE: v6.8.0
+      SHV_SDK_VERSION: 1.0.617.1a
+      SHV_SDK_SHA256: 56b6ad265b2b93aa4e73f79f97949d72f3683a35576b977e63dde91c6485fe22
+      UPSTREAM_SHA: 8607693be42ce02442251f05e0495f58c2b77e5d
+    defaults:
+      run:
+        working-directory: upstream
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rehan-remade/universal-modder
+          ref: 8607693be42ce02442251f05e0495f58c2b77e5d
+          path: upstream
+          persist-credentials: false
+
+      # --- GTA side -------------------------------------------------------------------------------------------------
+      # The ScriptHookV SDK is only compiled against (headers + import library) and deleted before packaging.
+      # It comes from dev-c.com (honest request, no browser imitation) or the SHV_SDK_URL secret.
+      - name: Get the ScriptHookV SDK (headers + import library only)
+        shell: bash
+        env:
+          SHV_SDK_URL: ${{ secrets.SHV_SDK_URL }}
+        run: |
+          set -euo pipefail
+          url="${SHV_SDK_URL:-https://www.dev-c.com/files/ScriptHookV_SDK_${SHV_SDK_VERSION}.zip}"
+          if ! curl -fsSL --retry 3 -A "GitHub Actions build of ${GITHUB_REPOSITORY}" -o shv_sdk.zip "$url" || ! 7z t -bso0 shv_sdk.zip; then
+            echo "::error::Could not download the ScriptHookV SDK zip. dev-c.com may refuse GitHub's servers: download ScriptHookV_SDK_${SHV_SDK_VERSION}.zip in a browser from https://www.dev-c.com/gtav/scripthookv/, keep a private copy, and set the repository secret SHV_SDK_URL to it (see the README)."
+            exit 1
+          fi
+          sum=$(sha256sum shv_sdk.zip | cut -d' ' -f1)
+          echo "ScriptHookV SDK zip SHA-256: $sum"
+          if [ -n "$SHV_SDK_SHA256" ] && [ "$sum" != "$SHV_SDK_SHA256" ]; then
+            echo "::error::The ScriptHookV SDK zip changed (expected $SHV_SDK_SHA256)."; exit 1
+          fi
+          mkdir -p sdk "$EX/gta/third_party/shv"
+          7z x -bso0 -y -osdk shv_sdk.zip
+          cp sdk/inc/main.h sdk/inc/nativeCaller.h sdk/inc/types.h sdk/lib/ScriptHookV.lib "$EX/gta/third_party/shv/"
+          rm -rf sdk shv_sdk.zip
+
+      - name: Fetch the ReShade 6.8.0 add-on headers and check them
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$EX/gta/third_party/reshade"; mkdir -p "$d"
+          for f in reshade.hpp reshade_api.hpp reshade_api_device.hpp reshade_api_pipeline.hpp reshade_api_resource.hpp \
+                   reshade_api_format.hpp reshade_events.hpp reshade_overlay.hpp; do
+            curl -fsSL --retry 3 "https://raw.githubusercontent.com/crosire/reshade/${RESHADE}/include/$f" -o "$d/$f"
+          done
+          cd "$d"
+          sha256sum -c - <<'EOF'
+          cf3cd150920ea310b4b1e2e4f11ab8d7221a9fc18755f4891a026563311b524c  reshade.hpp
+          8d83ec8a620c48da7a20d975bd27b3345b24d3f0d5b78ae4c4fe633d61b804eb  reshade_api.hpp
+          a716c44b6fbb064dbbb0826687728f21aa71ed45e13564e4dc1cdf36da5bdfa0  reshade_api_device.hpp
+          5bda8e07260c2c60f0fd18a78b11782aed8f69e5d24b5757874614caafdf416f  reshade_api_pipeline.hpp
+          32cdafe6d783813f3ac72ad43e426638d8d0fef56bcb558fad218a14cfb75ee3  reshade_api_resource.hpp
+          68caa17fef712043e810ab88770c15af009aa3c7693e5c115ddc324f2d0809a7  reshade_api_format.hpp
+          2717f56e2bd89af6d708c9c316353d6581c5a41d4526629fadba51d13be57a89  reshade_events.hpp
+          ed914b12fbc41ed038287b0163c0bc934772afcff2c22392044c6008adc5ae79  reshade_overlay.hpp
+          EOF
+
+      - name: Build MCPassthrough.asi (Visual Studio C++ x64, found by build.bat via vswhere)
+        shell: cmd
+        run: |
+          call examples\minecraft-gta5-passthrough\gta\build.bat
+          if errorlevel 1 exit /b 1
+          if not exist examples\minecraft-gta5-passthrough\gta\build\MCPassthrough.asi exit /b 1
+
+      # --- Minecraft side -------------------------------------------------------------------------------------------
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4 # caches Gradle and checks gradle-wrapper.jar is genuine
+
+      - name: Build the Fabric mod
+        shell: cmd
+        working-directory: upstream/examples/minecraft-gta5-passthrough/mc
+        run: gradlew.bat build --no-daemon --stacktrace
+
+      # --- Package --------------------------------------------------------------------------------------------------
+      - name: Package the release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${TAG#v}"; VER="${VER:-dev-${UPSTREAM_SHA::7}}"
+          OUT=dist; GAME=stage/game
+          rm -rf "$OUT" stage "$EX/gta/third_party/shv"   # the SDK is only for compiling: never keep or publish it
+          mkdir -p "$OUT" "$GAME/reshade-shaders/Shaders"
+
+          jar=""   # the mod jar (not -sources/-dev)
+          for f in "$EX"/mc/build/libs/*.jar; do case "$f" in *-sources.jar|*-dev.jar) ;; *) jar="$f" ;; esac; done
+          test -f "$jar"
+          cp "$jar" "$OUT/minecraft-gta5-fabric-${VER}.jar"
+          cp "$EX/gta/build/MCPassthrough.asi" "$OUT/"
+          cp LICENSE "$OUT/LICENSE.txt"
+
+          # NOTICE: third-party code compiled into MCPassthrough.asi or bundled in the jar
+          {
+            echo "Minecraft x GTA V passthrough (universal-modder example) ${VER} - third-party notices"
+            echo
+            echo "MCPassthrough.asi is compiled with:"
+            echo "  - the ScriptHookV SDK ${SHV_SDK_VERSION} by Alexander Blade (https://www.dev-c.com/gtav/scripthookv/):"
+            echo "    its headers and ScriptHookV.lib import library. The SDK and ScriptHookV.dll are not included."
+            echo "  - ReShade add-on API headers (crosire/reshade v6.8.0), BSD-3-Clause OR MIT"
+            echo "The Fabric mod jar bundles Java-WebSocket 1.6.0 (TooTallNate/Java-WebSocket), MIT."
+            echo "GTA V native names and hashes in natives.h come from alloc8or's gta5-nativedb-data."
+            echo
+            echo "Not included, install them separately: ScriptHookV + its ASI loader (dinput8.dll) from dev-c.com,"
+            echo "ReShade 6.8.0 with add-on support, ReShade.fxh (crosire/reshade-shaders), Fabric Loader, Fabric API,"
+            echo "and both games (GTA V Legacy, story mode only, BattlEye off)."
+            echo
+            echo "==== ReShade (crosire/reshade v6.8.0): LICENSE.md ===="
+            curl -fsSL https://raw.githubusercontent.com/crosire/reshade/v6.8.0/LICENSE.md; echo
+            echo "==== Java-WebSocket 1.6.0: LICENSE ===="
+            curl -fsSL https://raw.githubusercontent.com/TooTallNate/Java-WebSocket/v1.6.0/LICENSE; echo
+          } > "$OUT/NOTICE.txt"
+
+          # the example's own GTA-side files where install.sh puts them (no ScriptHookV, no ReShade, no .fxh)
+          cp "$EX/gta/build/MCPassthrough.asi" "$GAME/"
+          cp "$EX/gta/shaders/MCPassthrough.fx" "$GAME/reshade-shaders/Shaders/"
+          mkdir -p "$GAME/MCPassthrough-licenses"
+          cp "$OUT/LICENSE.txt" "$OUT/NOTICE.txt" "$GAME/MCPassthrough-licenses/"
+          (cd "$GAME" && 7z a -tzip -bso0 "../../$OUT/minecraft-gta5-${VER}.zip" .)
+
+          # "<sha256>  <file>" lines (the sed drops the "*" binary marker Git Bash on Windows may add)
+          # (written outside dist first so the list never includes itself)
+          (cd "$OUT" && sha256sum -- * | sed 's/ \*/  /' > ../SHA256SUMS.txt) && mv SHA256SUMS.txt "$OUT/" && cat "$OUT/SHA256SUMS.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-gta5-build
+          path: upstream/dist/*
+          if-no-files-found: error
+
+      - name: Publish the GitHub release
+        if: env.TAG != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Community build of the Minecraft x GTA V passthrough example
+          ([universal-modder](https://github.com/rehan-remade/universal-modder), \`examples/minecraft-gta5-passthrough\`,
+          by Rehan and contributors, MIT), built by GitHub Actions from upstream commit ${UPSTREAM_SHA}.
+          Not made or endorsed by Rehan, Mojang, Microsoft, Rockstar Games or Take-Two.
+
+          - \`minecraft-gta5-${TAG#v}.zip\`: MCPassthrough.asi and MCPassthrough.fx, laid out like the GTA V folder
+          - \`minecraft-gta5-fabric-${TAG#v}.jar\`: the Fabric mod (Minecraft 26.3)
+          - \`SHA256SUMS.txt\`: checksums of every file
+
+          You still need ScriptHookV and its ASI loader from https://www.dev-c.com/gtav/scripthookv/, ReShade 6.8.0
+          with add-on support, ReShade.fxh, Fabric Loader and Fabric API. GTA V Legacy, story mode only, BattlEye off.
+          Credits and third-party licences: NOTICE.txt.
+          EOF
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Minecraft x GTA V ${TAG}" --notes-file notes.md
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/* --clobber
